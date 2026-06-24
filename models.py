@@ -8,6 +8,10 @@ class ModelProvider(Enum):
 
     OLLAMA = "ollama"
     GEMINI = "gemini"
+    OPENROUTER = "openrouter"
+    NVIDIA = "nvidia"
+    GROQ = "groq"
+    ROUTER = "router"
 
 
 @runtime_checkable
@@ -389,3 +393,186 @@ class GeminiProvider:
                     f"Retrying in {sleep_time}s..."
                 )
                 time.sleep(sleep_time)
+
+
+class OpenAICompatibleProvider:
+    """Generic OpenAI-compatible LLM provider implementation."""
+
+    def __init__(self, api_key: str, base_url: str):
+        self.api_key = api_key
+        self.base_url = base_url
+
+    def chat(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        options: Dict[str, Any] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Send a chat request to the OpenAI-compatible API."""
+        import requests
+        import json
+        import time
+        import random
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        MAX_RETRIES = 5
+        BASE_DELAY = 2.0
+        MAX_DELAY = 60.0
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        if "openrouter.ai" in self.base_url:
+            headers["HTTP-Referer"] = "https://github.com/interviewstreet/hiring-agent"
+            headers["X-Title"] = "Hiring Agent"
+
+        payload = {
+            "model": model,
+            "messages": messages,
+        }
+
+        if options:
+            if "temperature" in options:
+                payload["temperature"] = options["temperature"]
+            if "top_p" in options:
+                payload["top_p"] = options["top_p"]
+
+        if "format" in kwargs:
+            payload["response_format"] = {"type": "json_object"}
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = requests.post(
+                    self.base_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=90,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                if "error" in data:
+                    raise ValueError(f"API Error returned in body: {data['error']}")
+
+                content = data["choices"][0]["message"]["content"]
+                return {"message": {"role": "assistant", "content": content}}
+
+            except Exception as e:
+                status_code = None
+                if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
+                    status_code = e.response.status_code
+
+                if status_code in (429, 500, 502, 503, 504) or attempt < MAX_RETRIES - 1:
+                    if attempt == MAX_RETRIES - 1:
+                        raise
+
+                    delay = min(BASE_DELAY * (2 ** attempt), MAX_DELAY)
+                    sleep_time = round(delay * random.uniform(0.8, 1.2), 2)
+                    logger.warning(
+                        f"[OpenAICompatibleProvider - {self.base_url}] Request failed: {e}. "
+                        f"Retrying in {sleep_time}s (attempt {attempt + 1}/{MAX_RETRIES})..."
+                    )
+                    time.sleep(sleep_time)
+                else:
+                    raise
+
+
+class OpenRouterProvider(OpenAICompatibleProvider):
+    """OpenRouter LLM provider implementation."""
+
+    def __init__(self, api_key: str):
+        super().__init__(api_key, "https://openrouter.ai/api/v1/chat/completions")
+
+
+class NvidiaProvider(OpenAICompatibleProvider):
+    """NVIDIA NIM LLM provider implementation."""
+
+    def __init__(self, api_key: str):
+        super().__init__(api_key, "https://integrate.api.nvidia.com/v1/chat/completions")
+
+
+class GroqProvider(OpenAICompatibleProvider):
+    """Groq LLM provider implementation."""
+
+    def __init__(self, api_key: str):
+        super().__init__(api_key, "https://api.groq.com/openai/v1/chat/completions")
+
+
+class RoutingLLMProvider:
+    """Fault-tolerant LLM router that load-balances and handles fallbacks across multiple providers."""
+
+    def __init__(self, providers: List[Tuple[str, Any, str]], calls_per_provider: int = 5):
+        """
+        Args:
+            providers: A list of tuples containing (provider_name, provider_instance, provider_model)
+            calls_per_provider: Number of consecutive successful calls before rotating
+        """
+        if not providers:
+            raise ValueError("RoutingLLMProvider requires at least one active provider.")
+        self.providers = providers
+        self.calls_per_provider = calls_per_provider
+        self.current_idx = 0
+        self.success_count = 0
+
+    def chat(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        options: Dict[str, Any] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Send a chat request by routing to the current active provider with fallback support."""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        num_providers = len(self.providers)
+        last_exception = None
+
+        for attempt in range(num_providers):
+            provider_name, provider_inst, provider_model = self.providers[self.current_idx]
+
+            try:
+                logger.info(
+                    f"🚀 [RoutingLLMProvider] Routing call to {provider_name} "
+                    f"using model '{provider_model}' (consecutive successes: {self.success_count}/{self.calls_per_provider})"
+                )
+                
+                res = provider_inst.chat(
+                    model=provider_model,
+                    messages=messages,
+                    options=options,
+                    **kwargs
+                )
+
+                # Successful call! Update sticky routing state
+                self.success_count += 1
+                if self.success_count >= self.calls_per_provider:
+                    old_name = provider_name
+                    self.current_idx = (self.current_idx + 1) % num_providers
+                    self.success_count = 0
+                    logger.info(
+                        f"🔄 [RoutingLLMProvider] Capped {self.calls_per_provider} successful calls to {old_name}. "
+                        f"Rotating next provider to {self.providers[self.current_idx][0]}."
+                    )
+                
+                return res
+
+            except Exception as e:
+                # Failure! Immediately switch to the next provider and reset success count
+                logger.error(
+                    f"❌ [RoutingLLMProvider] Call to {provider_name} failed: {e}. "
+                    f"Diverting to fallback provider."
+                )
+                last_exception = e
+                self.current_idx = (self.current_idx + 1) % num_providers
+                self.success_count = 0
+
+        logger.critical("🚨 [RoutingLLMProvider] All available active providers failed to handle the request!")
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("RoutingLLMProvider execution failed without exception details.")
